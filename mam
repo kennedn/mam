@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Get the script name (for help text)
+SCRIPT_NAME=$(basename "$0")
+
+# Print help text and exit
+help() {
+  cat << EOF
+usage: $SCRIPT_NAME [OPTION] [TERM]...
+Query MyAnonamouse for torrents
+Example: $SCRIPT_NAME -a "The Fisherman"
+
+Options:
+  -a,--audiobooks
+        search audiobooks (default)
+  -e,--ebooks
+        search e-books
+  -A,--all-categories
+        search all main categories
+  -f,--freeleech
+        show only freeleech torrents
+  -h,--help
+        print this message
+EOF
+  exit 0
+}
+
+CATEGORY=13
+SEARCH_TYPE="all"
+POSITIONAL=()
+
+# Parse CLI options
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      help
+      ;;
+    -a|--audiobooks)
+      CATEGORY=13
+      shift
+      ;;
+    -e|--ebooks)
+      CATEGORY=14
+      shift
+      ;;
+    -A|--all-categories)
+      CATEGORY=0
+      shift
+      ;;
+    -f|--freeleech)
+      SEARCH_TYPE="fl"
+      shift
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# Restore search terms into $@
+set -- "${POSITIONAL[@]}"
+
+# Check dependencies
+for cmd in curl jq fzf column; do
+  command -v "$cmd" >/dev/null || {
+    echo "Missing dependency: $cmd" >&2
+    exit 1
+  }
+done
+
+# Build API URL and retrieve authentication cookie
+base_url="https://www.myanonamouse.net"
+url="${base_url}/tor/js/loadSearchJSONbasic.php"
+# Set MAM_ID in your environment, or use rbw as a fallback
+if [ -z "${MAM_ID:-}" ]; then
+  if ! command -v rbw >/dev/null; then
+    echo "Error: Set MAM_ID or install and configure rbw to retrieve the API cookie" >&2
+    exit 1
+  fi
+
+  if ! MAM_ID=$(rbw get myanonamouse.net --field "mam_id (API)") || [ -z "$MAM_ID" ]; then
+    echo "Error: Could not retrieve the API cookie using rbw; set MAM_ID or check your rbw entry" >&2
+    exit 1
+  fi
+fi
+
+# Build JSON search request
+payload=$(jq -n \
+  --arg text "$*" \
+  --arg search_type "$SEARCH_TYPE" \
+  --argjson category "$CATEGORY" \
+  '{
+    tor: {
+      text: $text,
+      srchIn: ["title", "author", "narrator"],
+      searchType: $search_type,
+      searchIn: "torrents",
+      main_cat: (if $category == 0 then [13,14,15,16] else [$category] end),
+      cat: ["0"],
+      sortType: "default",
+      startNumber: 0
+    },
+    perpage: 1000
+  }')
+
+# Fetch JSON search results
+req=$(mktemp)
+trap 'rm -f "$req"' EXIT
+
+status=$(
+  curl \
+    --connect-timeout 5 \
+    -sS \
+    -X POST \
+    -w "%{http_code}" \
+    -o "$req" \
+    -b "mam_id=$MAM_ID" \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    "$url"
+)
+
+[ "$status" -ne 200 ] && echo "Error: HTTP $status" && exit 1
+
+# Parse JSON and collate torrent metadata using jq
+torrents_table=$(jq -r '
+  (["ID", "FL", "SEEDERS", "SIZE", "CATEGORY", "NAME"] | join("\u001F")),
+  (
+    .data[]
+    | [
+        .id,
+        (if .free == 1 or .free == true then "🪙" else "--" end),
+        .seeders,
+        .size,
+        (.catname | split(" - ") | last),
+        (.title | tostring | gsub("[\t\r\n]"; " "))
+      ]
+    | join("\u001F")
+  )
+' < "$req" | column -s $'\x1F' -t)
+
+# Exit if no torrents returned (just header)
+[ "$(echo "$torrents_table" | wc -l)" -lt 2 ] && \
+  echo "No torrents found" && exit 0
+
+# Launch fzf to allow the user to select torrents
+selected=$(echo "$torrents_table" |
+  fzf --multi \
+      --header-lines=1 \
+      --with-nth=2.. \
+      --no-hscroll \
+      --prompt="Torrents > ") || exit 0
+
+# Exit silently if nothing was selected
+[ -z "$selected" ] && exit 0
+
+# Download selected torrents
+echo "$selected" | awk '{print $1}' | while read -r tid; do
+  curl -fL \
+    --progress-bar \
+    -w '\nDownloaded: %{filename_effective} (%{size_download} bytes)\n\n' \
+    -b "mam_id=$MAM_ID" \
+    -OJ \
+    "$base_url/tor/download.php?tid=$tid"
+done
